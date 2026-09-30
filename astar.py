@@ -24,7 +24,8 @@ NEIGHBORS = [
 
 class AStarPathfinder:
     def __init__(self, map_array: np.array, start: tuple, goal: tuple, wall_influence=5.0, buffer_factor=2.0,
-                 robot_radius_px=3, unknown_cost=1.0, frontier_margin_px=3):
+                 robot_radius_px=None, unknown_cost=1.0, frontier_margin_px=3,
+                 robot_radius_m=0.07, safety_margin_m=0.05, resolution=0.05):
         """
         Inicializa o A* com mapa, ponto inicial, objetivo e parâmetros de influência.
 
@@ -35,15 +36,22 @@ class AStarPathfinder:
             wall_influence (float): Peso da proximidade das paredes.
             buffer_factor (float): Escala da influência das paredes.
             robot_radius_px (float): Distância mínima (em pixels) entre o centro do robô e qualquer parede.
-                Células mais próximas que isso são intransponíveis. Depende da resolução do mapa
-                (metros/pixel) e do tamanho do robô: raio_px = (raio_robo_m + folga_m) / resolucao_m_por_px.
+                Células mais próximas que isso são intransponíveis. Se None, é calculado a partir de
+                robot_radius_m, safety_margin_m e resolution (recomendado).
             unknown_cost (float): Custo extra por passo em célula desconhecida (faz o robô preferir o conhecido).
             frontier_margin_px (int): Quantos pontos o caminho recua antes da fronteira com o desconhecido.
+            robot_radius_m (float): Raio real do robô em metros (círculo que o envolve, a partir do centro de rotação).
+            safety_margin_m (float): Folga extra em metros, para cobrir o erro de localização.
+            resolution (float): Resolução do mapa em metros/pixel (campo `resolution` do .yaml do mapa).
         """
         self.start = tuple(int(v) for v in start)
         self.goal = tuple(int(v) for v in goal)
         self.wall_influence = wall_influence
         self.buffer_factor = buffer_factor
+        if robot_radius_px is None:
+            # A distância é medida até o centro do pixel de parede, mas a parede começa meio pixel
+            # antes, por isso o + 0.5.
+            robot_radius_px = (robot_radius_m + safety_margin_m) / resolution + 0.5
         self.robot_radius_px = robot_radius_px
         self.unknown_cost = unknown_cost
         self.frontier_margin_px = frontier_margin_px
@@ -446,7 +454,7 @@ def prep_map(map_path: str) -> np.array:
 
 
 def main():
-    map_array = prep_map('map3.pgm')
+    map_array = prep_map('map5.pgm')
     astar = AStarPathfinder(map_array, (60, 20), (60, 120), wall_influence=10.0, buffer_factor=3.0)
     astar.run(gif='astar.gif', frame_every=30)
 
