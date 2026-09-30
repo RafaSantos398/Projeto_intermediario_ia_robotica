@@ -3,12 +3,18 @@ import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 from scipy.ndimage import distance_transform_edt
+from PIL import Image
 import math
 
 # Valores das células depois do prep_map()
 WALL = 0
 UNKNOWN = 128
 FREE = 255
+
+# Cores usadas no GIF (RGB)
+CLOSED_COLOR = (120, 170, 255)   # nós já expandidos
+OPEN_COLOR = (255, 210, 80)      # fronteira (fila aberta)
+CURRENT_COLOR = (255, 0, 0)      # nó sendo expandido agora
 
 # 8 vizinhos: (dlinha, dcoluna, custo do movimento)
 NEIGHBORS = [
@@ -18,7 +24,7 @@ NEIGHBORS = [
 
 class AStarPathfinder:
     def __init__(self, map_array: np.array, start: tuple, goal: tuple, wall_influence=5.0, buffer_factor=2.0,
-                 robot_radius_px=3, unknown_cost=5.0, frontier_margin_px=3):
+                 robot_radius_px=3, unknown_cost=1.0, frontier_margin_px=3):
         """
         Inicializa o A* com mapa, ponto inicial, objetivo e parâmetros de influência.
 
@@ -42,6 +48,10 @@ class AStarPathfinder:
         self.unknown_cost = unknown_cost
         self.frontier_margin_px = frontier_margin_px
         self.GOAL_REACHEABLE = False
+
+        # Estado da gravação do GIF (preenchido em find_path(record=True)).
+        self.frames = []
+        self._canvas = None
 
         # Prepara o mapa, expandindo suas bordas e ajustando o array.
         self.map = map_array.copy()
@@ -114,9 +124,80 @@ class AStarPathfinder:
         i = np.argmin((safe_rows - node[0]) ** 2 + (safe_cols - node[1]) ** 2)
         return (int(safe_rows[i]), int(safe_cols[i]))
 
-    def find_path(self):
+    # ------------------------------------------------------------------
+    # Gravação do GIF
+    # ------------------------------------------------------------------
+    def _base_canvas(self) -> np.array:
+        """Imagem RGB do mapa: parede preta, desconhecido cinza, livre branco."""
+        canvas = np.zeros((*self.map_array.shape, 3), np.uint8)
+        canvas[self.map_array == UNKNOWN] = (128, 128, 128)
+        canvas[self.map_array == FREE] = (255, 255, 255)
+        return canvas
+
+    def _snapshot(self, canvas: np.array, current: tuple) -> np.array:
+        """Cópia do canvas com início, objetivo e nó atual destacados."""
+        img = canvas.copy()
+        img[self.start] = (0, 200, 0)
+        img[self.goal] = (0, 0, 255)
+        img[current] = CURRENT_COLOR
+        return img
+
+    def save_gif(self, filename: str, path: list = None, scale=4, fps=25, hold_final=30):
+        """
+        Salva o GIF do processo de busca (requer find_path(record=True)).
+
+        Args:
+            filename (str): Caminho do GIF de saída.
+            path (list): Caminho a ser desenhado por cima no frame final.
+            scale (int): Quantos pixels do GIF representam 1 pixel do mapa.
+            fps (int): Frames por segundo.
+            hold_final (int): Quantos frames o resultado final fica parado no fim.
+        """
+        if not self.frames or self._canvas is None:
+            print("Nenhum frame gravado.")
+            return
+
+        final = self._canvas.copy()
+
+        # Recorta na região explorada, para não mostrar o padding desconhecido inteiro.
+        closed = np.all(final == CLOSED_COLOR, axis=2)
+        rows, cols = np.nonzero(closed)
+        if len(rows) == 0:
+            r0, r1, c0, c1 = 0, final.shape[0], 0, final.shape[1]
+        else:
+            m = 10  # margem do recorte
+            r0, r1 = max(rows.min() - m, 0), min(rows.max() + m, final.shape[0])
+            c0, c1 = max(cols.min() - m, 0), min(cols.max() + m, final.shape[1])
+
+        def prep(img):
+            img = img[r0:r1, c0:c1]
+            return cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
+
+        frames = [prep(f) for f in self.frames]
+
+        # Frame final com o caminho desenhado por cima.
+        last = prep(self._snapshot(final, self.goal))
+        if path:
+            pts = np.array([[(c - c0 + 0.5) * scale, (r - r0 + 0.5) * scale] for r, c in path],
+                           np.int32).reshape(-1, 1, 2)
+            cv2.polylines(last, [pts], False, (255, 0, 255), max(1, scale // 2))
+        frames += [last] * hold_final
+
+        imgs = [Image.fromarray(f) for f in frames]
+        imgs[0].save(filename, save_all=True, append_images=imgs[1:],
+                     duration=int(1000 / fps), loop=0, optimize=True)
+        print(f"GIF salvo em {filename} ({len(imgs)} frames)")
+
+    # ------------------------------------------------------------------
+    # A*
+    # ------------------------------------------------------------------
+    def find_path(self, record=False, frame_every=30):
         """
         Executa o algoritmo A* para encontrar caminho até o objetivo.
+
+        Args:
+            record (bool): Se True, grava frames da busca para o GIF.
+            frame_every (int): Grava um frame a cada N nós expandidos.
 
         Returns:
             dict: Predecessores dos nós no caminho. Se o caminho não for encontrado, retorna None.
@@ -142,13 +223,26 @@ class AStarPathfinder:
         open_heap = [(self.heuristic(start, goal), 0.0, start)]
         closed = set()
 
+        self.frames = []
+        n_expanded = 0
+        if record:
+            self._canvas = self._base_canvas()
+
         while open_heap:
             _, g, current = heapq.heappop(open_heap)
             if current in closed:
                 continue
             if current == goal:
+                if record:
+                    self.frames.append(self._snapshot(self._canvas, current))
                 return came_from, current
             closed.add(current)
+
+            if record:
+                self._canvas[current] = CLOSED_COLOR
+                n_expanded += 1
+                if n_expanded % frame_every == 0:
+                    self.frames.append(self._snapshot(self._canvas, current))
 
             escaping = self.unsafe[current]
             for dr, dc, step in NEIGHBORS:
@@ -179,6 +273,8 @@ class AStarPathfinder:
                     g_score[nb] = new_g
                     came_from[nb] = current
                     heapq.heappush(open_heap, (new_g + self.heuristic(nb, goal), new_g, nb))
+                    if record:
+                        self._canvas[nb] = OPEN_COLOR
 
         print("Caminho não encontrado")
         return None, None
@@ -286,34 +382,40 @@ class AStarPathfinder:
         plt.axis('equal')
         plt.show()
 
-    def run(self, show_path=True):
+    def run(self, show_path=True, gif=None, frame_every=30):
         """
         Essa função é chamada pelo navegador para executar o algoritmo A* e gerar o caminho.
         Executa o processo completo: busca, reconstrução, simplificação e visualização do caminho.
-        
+
         Args:
             show_path (bool): Se True, exibe o caminho graficamente.
+            gif (str): Se informado, salva o GIF do processo de busca nesse arquivo.
+            frame_every (int): Grava um frame a cada N nós expandidos (só vale com gif).
 
         Returns:
             list or None: Caminho simplificado ou None se não encontrado.
         """
         print("Iniciando busca pelo caminho...")
-        came_from, final_node = self.find_path()
+        came_from, final_node = self.find_path(record=gif is not None, frame_every=frame_every)
 
         if final_node:
             print("Reconstruindo caminho...")
             path = self.reconstruct_path(came_from, final_node)
-            
+
             print("Robo não anda no disconhecido")
             path = self.know_path(path)
 
             print("Caminho encontrado, simplificando...")
             simplified_path = self.simplify_path(path)
 
+            if gif:
+                print("Salvando GIF...")
+                self.save_gif(gif, path=path)   # troque por simplified_path se preferir
+
             print("Plotando o caminho...")
             if show_path:
                 self.plot_path(path, simplified_path)
-            
+
             return simplified_path
         else:
             print("Nenhum caminho pôde ser encontrado.")
@@ -344,9 +446,9 @@ def prep_map(map_path: str) -> np.array:
 
 
 def main():
-    map_array = prep_map('map5.pgm')
+    map_array = prep_map('map3.pgm')
     astar = AStarPathfinder(map_array, (60, 20), (60, 120), wall_influence=10.0, buffer_factor=3.0)
-    astar.run()
+    astar.run(gif='astar.gif', frame_every=30)
 
 
 if __name__ == '__main__':
