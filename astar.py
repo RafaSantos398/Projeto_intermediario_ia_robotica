@@ -453,10 +453,164 @@ def prep_map(map_path: str) -> np.array:
     return map_array
 
 
+def reveal_disk(known: np.array, truth, center: tuple, radius: int):
+    """
+    Simula o sensor: as células desconhecidas num raio em volta de `center` passam a ser conhecidas.
+
+    Args:
+        known (np.array): Mapa que o robô conhece (modificado no lugar).
+        truth (np.array or None): Mapa "real". Se None, assume que o desconhecido é livre.
+        center (tuple): Posição do robô (linha, coluna).
+        radius (int): Alcance do sensor em pixels.
+    """
+    rows, cols = known.shape
+    r, c = center
+    r0, r1 = max(r - radius, 0), min(r + radius + 1, rows)
+    c0, c1 = max(c - radius, 0), min(c + radius + 1, cols)
+    rr, cc = np.ogrid[r0:r1, c0:c1]
+    disk = (rr - r) ** 2 + (cc - c) ** 2 <= radius ** 2
+    window = known[r0:r1, c0:c1]          # view: escrever aqui altera `known`
+    mask = disk & (window == UNKNOWN)
+    if truth is None:
+        window[mask] = FREE
+    else:
+        window[mask] = truth[r0:r1, c0:c1][mask]
+
+
+def _render_nav(known, trail, pos, goal, box, scale):
+    """Frame RGB da navegação: mapa conhecido, trajeto percorrido, robô e objetivo."""
+    img = np.zeros((*known.shape, 3), np.uint8)
+    img[known == UNKNOWN] = (128, 128, 128)
+    img[known == FREE] = (255, 255, 255)
+    r0, r1, c0, c1 = box
+    img = cv2.resize(img[r0:r1, c0:c1], None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
+
+    def to_xy(p):
+        return int((p[1] - c0 + 0.5) * scale), int((p[0] - r0 + 0.5) * scale)
+
+    if len(trail) > 1:
+        pts = np.array([to_xy(p) for p in trail], np.int32).reshape(-1, 1, 2)
+        cv2.polylines(img, [pts], False, (255, 0, 255), max(1, scale // 2))
+    cv2.circle(img, to_xy(goal), scale * 2, (0, 0, 255), -1)
+    cv2.circle(img, to_xy(pos), scale * 2, (0, 200, 0), -1)
+    return img
+
+
+def navigate_to_goal(map_array: np.array, start: tuple, goal: tuple, sensor_radius_px=20,
+                     max_iters=100, truth_map=None, show=True, gif=None, gif_scale=3, fps=4,
+                     **astar_kwargs):
+    """
+    Repete o ciclo "planejar -> andar até a fronteira -> descobrir mais mapa" até chegar no objetivo.
+
+    Como o mapa que temos é estático, o sensor é simulado: a cada passo, as células desconhecidas
+    num raio de `sensor_radius_px` em volta do robô viram conhecidas. Se `truth_map` for passado,
+    elas assumem os valores reais dele; senão, assume-se que o desconhecido é livre.
+    Num robô de verdade, quem faz esse papel é o SLAM: o navegador só chama AStarPathfinder.run()
+    de novo com o mapa atualizado.
+
+    Args:
+        map_array (np.array): Mapa inicial (saída do prep_map).
+        start (tuple): Posição inicial (linha, coluna).
+        goal (tuple): Objetivo (linha, coluna).
+        sensor_radius_px (int): Alcance do sensor simulado. Precisa ser maior que frontier_margin_px.
+        max_iters (int): Limite de replanejamentos.
+        truth_map (np.array or None): Mapa real opcional, com o mesmo formato de map_array.
+        show (bool): Se True, plota o resultado final.
+        gif (str): Se informado, salva um GIF com um frame por replanejamento.
+        gif_scale (int): Ampliação de cada pixel do mapa no GIF.
+        fps (int): Frames por segundo do GIF.
+        **astar_kwargs: Parâmetros repassados ao AStarPathfinder (wall_influence, unknown_cost...).
+
+    Returns:
+        list or None: Waypoints simplificados de todo o trajeto, ou None se não chegou.
+    """
+    margin = astar_kwargs.get("frontier_margin_px", 3)
+    if sensor_radius_px <= margin + 1:
+        raise ValueError("sensor_radius_px precisa ser maior que frontier_margin_px + 1")
+
+    known = map_array.copy().astype(np.uint8)
+    pos = tuple(int(v) for v in start)
+    goal = tuple(int(v) for v in goal)
+    trail, waypoints = [pos], [pos]
+    reached = False
+
+    # Recorte do GIF/plot: região inicialmente conhecida + início + objetivo.
+    ks = np.argwhere(known != UNKNOWN)
+    pts_box = np.vstack([ks.min(axis=0), ks.max(axis=0), pos, goal])
+    m = sensor_radius_px
+    box = (max(pts_box[:, 0].min() - m, 0), min(pts_box[:, 0].max() + m, known.shape[0]),
+           max(pts_box[:, 1].min() - m, 0), min(pts_box[:, 1].max() + m, known.shape[1]))
+
+    reveal_disk(known, truth_map, pos, sensor_radius_px)
+    frames = [_render_nav(known, trail, pos, goal, box, gif_scale)] if gif else []
+
+    for it in range(1, max_iters + 1):
+        astar = AStarPathfinder(known, pos, goal, **astar_kwargs)
+        came_from, final_node = astar.find_path()
+        if final_node is None:
+            print(f"[{it}] Sem caminho a partir de {pos}.")
+            break
+        goal = astar.goal  # pode ter sido movido para a célula segura mais próxima
+
+        path = astar.know_path(astar.reconstruct_path(came_from, final_node))
+        simplified = astar.simplify_path(path)
+
+        if len(path) <= 1 and not astar.GOAL_REACHEABLE:
+            print(f"[{it}] Robô travado em {pos}: sem progresso possível.")
+            break
+
+        # Anda pelo caminho e "enxerga" em volta durante o trajeto.
+        for p in path[::3] + [path[-1]]:
+            reveal_disk(known, truth_map, p, sensor_radius_px)
+        trail += path[1:]
+        waypoints += simplified[1:]
+        pos = path[-1]
+        print(f"[{it}] Robô em {pos} (objetivo {goal})")
+
+        if gif:
+            frames.append(_render_nav(known, trail, pos, goal, box, gif_scale))
+
+        if astar.GOAL_REACHEABLE:
+            reached = True
+            print(f"Objetivo alcançado em {it} replanejamentos.")
+            break
+    else:
+        print(f"Limite de {max_iters} replanejamentos atingido.")
+
+    if gif and len(frames) > 1:
+        imgs = [Image.fromarray(f) for f in frames + [frames[-1]] * 8]
+        imgs[0].save(gif, save_all=True, append_images=imgs[1:],
+                     duration=int(1000 / fps), loop=0, optimize=True)
+        print(f"GIF da navegação salvo em {gif} ({len(imgs)} frames)")
+
+    if show:
+        r0, r1, c0, c1 = box
+        plt.figure(figsize=(10, 10))
+        plt.imshow(known, cmap='gray', vmin=0, vmax=255)
+        ty, tx = zip(*trail)
+        plt.plot(tx, ty, color='magenta', linewidth=1, label='Trajeto percorrido')
+        wy, wx = zip(*waypoints)
+        plt.plot(wx, wy, color='red', linewidth=2, linestyle='--', label='Waypoints simplificados')
+        plt.scatter(start[1], start[0], color='green', s=100, label='Início')
+        plt.scatter(goal[1], goal[0], color='blue', s=100, label='Objetivo')
+        plt.xlim(c0, c1)
+        plt.ylim(r1, r0)
+        plt.legend()
+        plt.show()
+
+    return waypoints if reached else None
+
+
 def main():
-    map_array = prep_map('map5.pgm')
-    astar = AStarPathfinder(map_array, (60, 20), (60, 120), wall_influence=10.0, buffer_factor=3.0)
-    astar.run(gif='astar.gif', frame_every=30)
+    map_array = prep_map('map1.pgm')
+
+    # Navegação completa: replaneja até chegar no objetivo (ponto azul).
+    navigate_to_goal(map_array, (60, 20), (60, 120), sensor_radius_px=20,
+                     gif='navegacao.gif', wall_influence=10.0, buffer_factor=3.0)
+
+    # Um único planejamento (é o que o navegador chama a cada atualização do mapa):
+    # astar = AStarPathfinder(map_array, (60, 20), (60, 120), wall_influence=10.0, buffer_factor=3.0)
+    # astar.run(gif='astar.gif', frame_every=30)
 
 
 if __name__ == '__main__':
